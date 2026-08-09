@@ -27652,20 +27652,47 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)
 
-    # When an unexpected SIGTERM caused the shutdown and it wasn't a planned
-    # restart (/restart, /update, SIGUSR1), exit non-zero so systemd's
-    # Restart=on-failure revives the process.  This covers:
-    #   - hermes update killing the gateway mid-work
-    #   - External kill commands
-    #   - WSL2/container runtime sending unexpected signals
-    # `hermes gateway stop` and interactive Ctrl+C are handled above as
-    # planned stops and should not trigger service-manager revival.
+    # A signal-initiated shutdown that reached this point exits 0.
+    #
+    # Scope, stated precisely: this does NOT inspect whether the drain timed out
+    # (that value is local to stop() and is already logged there). The claim is
+    # only that the EXIT CODE is the wrong channel for "I was asked to stop",
+    # because no supervisor hermes configures uses it as one.
+    #
+    # This used to return False (exit 1) unconditionally, to make systemd's
+    # Restart=on-failure revive the gateway. But hermes does not generate that
+    # policy: `hermes_cli/gateway.py` writes `Restart=always` for systemd (see the
+    # unit templates) and `KeepAlive: <true/>` for launchd, and gateway.py's own
+    # docstring states that both "restart on any exit". So for every service file
+    # hermes itself installs, the nonzero exit revived nothing.
+    #
+    # What it DID do is corrupt the health signal. launchd's `last exit code` is
+    # sticky and carries no timestamp, and launchd's normal way to stop a job is
+    # SIGTERM — so every reboot and every `launchctl kickstart -k` left every
+    # gateway permanently reporting exit=1 while running perfectly. On 2026-08-08
+    # that was three gateways showing four days of false warnings on the fleet
+    # health dashboard, having shut down cleanly in 3.6s with drain timed_out=False.
+    # "I was asked to stop" belongs in the log (it is already there, as
+    # "Received SIGTERM — initiating shutdown" plus the shutdown-diag file), not in
+    # a status byte the supervisor never clears.
+    #
+    # Hand-written units that really do use Restart=on-failure or
+    # KeepAlive={SuccessfulExit: false} need the old behaviour to be revived, so it
+    # stays reachable via HERMES_EXIT_NONZERO_ON_SIGNAL=1 rather than being deleted.
     if _signal_initiated_shutdown and not runner._restart_requested:
+        if os.environ.get("HERMES_EXIT_NONZERO_ON_SIGNAL") == "1":
+            logger.info(
+                "Exiting with code 1 (signal-initiated shutdown without restart "
+                "request, HERMES_EXIT_NONZERO_ON_SIGNAL=1) so a Restart=on-failure "
+                "unit can revive the gateway."
+            )
+            return False  # → sys.exit(1) in the caller
         logger.info(
-            "Exiting with code 1 (signal-initiated shutdown without restart "
-            "request) so systemd Restart=on-failure can revive the gateway."
+            "Exiting with code 0 (signal-initiated shutdown, no restart "
+            "requested). Restart=always / KeepAlive revive on any exit; set "
+            "HERMES_EXIT_NONZERO_ON_SIGNAL=1 for a Restart=on-failure unit."
         )
-        return False  # → sys.exit(1) in the caller
+        return True
 
     # Older restart paths may reach here without ``runner.exit_code`` set.
     # Keep the historical non-zero fallback for service-managed restarts.
