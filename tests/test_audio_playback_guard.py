@@ -29,7 +29,7 @@ test from re-setting the variable mid-test.
 """
 
 import os
-import platform
+import shutil
 import subprocess
 import sys
 import types
@@ -38,6 +38,13 @@ import wave
 import pytest
 
 from tui_gateway import server
+
+# Resolved once, before any guard is installed. Gates the end-to-end test on
+# "is there a player to block?" rather than on the platform — the previous
+# Darwin-only gate meant Linux CI never ran it.
+_INSTALLED_PLAYER = next(
+    (p for p in ("afplay", "ffplay", "aplay", "paplay") if shutil.which(p)), None
+)
 
 
 def test_voice_toggle_still_leaks_the_env_var_but_speech_is_stubbed(monkeypatch):
@@ -174,11 +181,55 @@ def test_unmarked_test_cannot_launch_say():
 
     Basename matching is the point: ``/usr/bin/say`` is the same speaker.
     """
+    # Bare name, so basename matching is exercised against the real binary.
+    # ``say -o <file>`` renders to a file instead of the speakers, so this
+    # stays silent even on the day the guard regresses.
     with pytest.raises(RuntimeError, match="audio guard"):
-        subprocess.run(["/nonexistent/bin/say", "this must never be spoken"])
+        subprocess.run(
+            ["say", "-o", "/nonexistent/dir/out.aiff", "never spoken"]
+        )
 
     with pytest.raises(RuntimeError, match="audio guard"):
-        subprocess.Popen(["/nonexistent/bin/afplay", "/nonexistent/x.wav"])
+        subprocess.Popen(
+            ["/nonexistent/bin/say", "-o", "/nonexistent/out.aiff", "never"]
+        )
+
+
+def test_shell_wrapped_player_is_refused():
+    """``sh -c "… afplay …"`` is the WSL2 playback path, not a hypothetical.
+
+    ``play_audio_file`` inserts ``["/bin/sh", "-c", "( ffmpeg … && "
+    "powershell.exe … Media.SoundPlayer … )"]`` at the FRONT of its player
+    list on WSL2. A guard matching only the command head sees ``sh`` and lets
+    the real incident through on that platform.
+    """
+    with pytest.raises(RuntimeError, match="audio guard"):
+        subprocess.run(["/bin/sh", "-c", "afplay /nonexistent/x.wav"])
+
+    with pytest.raises(RuntimeError, match="audio guard"):
+        subprocess.Popen(["bash", "-c", "( ffplay -nodisp /nonexistent/x.wav )"])
+
+
+def test_bytes_and_quoted_argv_are_refused():
+    """Byte-string argv and quoted shell strings must not slip past.
+
+    ``str(b"afplay")`` is ``"b'afplay'"``, which matches no player name — so a
+    parser that stringifies without decoding waves real playback through.
+    """
+    with pytest.raises(RuntimeError, match="audio guard"):
+        subprocess.run([b"/usr/bin/afplay", b"/nonexistent/x.wav"])
+
+    with pytest.raises(RuntimeError, match="audio guard"):
+        subprocess.run('"/usr/bin/afplay" /nonexistent/x.wav', shell=True)
+
+
+def test_os_system_and_popen_are_refused():
+    """``os.system`` reaches a player without touching ``subprocess``."""
+    with pytest.raises(RuntimeError, match="audio guard"):
+        os.system("afplay /nonexistent/x.wav")
+
+    with pytest.raises(RuntimeError, match="audio guard"):
+        os.popen("say -o /nonexistent/dir/out.aiff hello")
 
 
 def test_guard_does_not_block_unrelated_subprocesses():
@@ -196,11 +247,10 @@ def test_guard_does_not_block_unrelated_subprocesses():
 
 
 @pytest.mark.skipif(
-    platform.system() != "Darwin",
-    reason="non-Darwin plays WAVs through sounddevice, not a subprocess — a "
-    "documented residual gap in _guard_audio_egress",
+    _INSTALLED_PLAYER is None,
+    reason="no system audio player on PATH, so there is nothing to block",
 )
-def test_tts_tool_playback_route_cannot_reach_the_speakers(tmp_path):
+def test_tts_tool_playback_route_cannot_reach_the_speakers(tmp_path, monkeypatch):
     """End-to-end: the exact call the TTS pipeline makes, and it stays silent.
 
     ``tools.voice_mode.play_audio_file`` is called here unmocked, with a real
@@ -208,7 +258,17 @@ def test_tts_tool_playback_route_cannot_reach_the_speakers(tmp_path):
     It must fail closed. ``play_audio_file`` swallows the guard's RuntimeError
     in its per-player ``except Exception`` and falls through to "no player
     available", so ``False`` is the observable signature of a blocked play.
+
+    Runs on every platform with a player installed, not just macOS. Forcing
+    ``_sounddevice_output_allowed`` off routes WAV playback to the system
+    player everywhere, so Linux CI exercises the same subprocess route macOS
+    takes natively — without this the guard's only end-to-end assertion never
+    ran in CI at all.
     """
+    import tools.voice_mode as voice_mode
+
+    monkeypatch.setattr(voice_mode, "_sounddevice_output_allowed", lambda: False)
+
     wav_path = tmp_path / "silence.wav"
     with wave.open(str(wav_path), "wb") as wf:
         wf.setnchannels(1)

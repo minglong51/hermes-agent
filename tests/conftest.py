@@ -1044,6 +1044,10 @@ _AUDIO_PLAYER_COMMANDS = frozenset({
     "ffplay",
 })
 
+# Shell wrappers whose ``-c`` script must be scanned for a player, because
+# ``play_audio_file`` front-loads ``["/bin/sh", "-c", …]`` on WSL2.
+_SHELL_COMMANDS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+
 
 def pytest_configure(config):  # noqa: D401 — pytest hook
     """Register markers used by hermetic conftest."""
@@ -1524,6 +1528,16 @@ def _audio_playback_guard(request, monkeypatch):
         yield
         return
 
+    # Install the egress backstop FIRST and unconditionally. It must not sit
+    # behind the ``hermes_cli.voice`` import below: that import can fail for
+    # reasons unrelated to audio (a missing optional dep, or a partial
+    # ``sys.modules`` entry left by an earlier test — a pattern these suites
+    # use), and ``play_audio_file``'s system-player path needs no Python
+    # audio deps at all, only ``shutil.which("afplay")``. Guarding it after
+    # the bail-out meant the backstop vanished in exactly the degraded
+    # environment where the route-specific stubs were also unavailable.
+    _guard_audio_egress(monkeypatch)
+
     try:
         import hermes_cli.voice as _voice
     except Exception:
@@ -1541,8 +1555,6 @@ def _audio_playback_guard(request, monkeypatch):
         monkeypatch.setattr(_voice, "speak_text", _blocked_speak_text)
     if hasattr(_voice, "play_audio_file"):
         monkeypatch.setattr(_voice, "play_audio_file", _blocked_play_audio_file)
-
-    _guard_audio_egress(monkeypatch)
 
     yield
 
@@ -1574,31 +1586,69 @@ def _guard_audio_egress(monkeypatch):
     thread the error names the offending test, and on a daemon thread it is
     swallowed exactly as the silent stubs would be. Either way, no audio.
 
+    Shell wrappers are matched too, and must be: ``play_audio_file`` puts
+    ``["/bin/sh", "-c", "( ffmpeg … && powershell.exe … Media.SoundPlayer … )"]``
+    at the *front* of the player list on WSL2, ahead of ffplay/aplay. A
+    head-only matcher sees ``sh`` and waves the real incident straight
+    through, so the ``-c`` script is scanned for a player token as well.
+
     Residual gap, documented rather than papered over: on non-macOS,
     ``play_audio_file`` plays WAVs through ``sounddevice.play`` instead of a
     subprocess. That path is not blocked here — patching ``sounddevice``
     would either force the import (which on macOS triggers the TCC
     media-library prompt ``_sounddevice_output_allowed`` exists to avoid) or
-    collide with tests that inject their own fake module. A player launched
-    through a shell wrapper (``sh -c "afplay …"``) is likewise unmatched,
-    since the command head is ``sh``; no hermes playback path does that, and
-    substring-matching the whole command line would start blocking unrelated
-    commands that merely mention a player's name.
+    collide with tests that inject their own fake module.
     """
+    import shlex
     import subprocess as _subprocess
 
-    def _audio_player_name(cmd):
+    def _as_text(value):
+        if isinstance(value, (bytes, bytearray)):
+            return value.decode("utf-8", "replace")
+        if isinstance(value, os.PathLike):
+            return os.fspath(value)
+        return str(value)
+
+    def _split(text):
+        try:
+            return shlex.split(text)
+        except ValueError:
+            # Unbalanced quotes — fall back to whitespace, never crash the
+            # guard on a command it merely failed to parse.
+            return text.split()
+
+    def _tokens(cmd):
+        """Argv as text, whether given as a sequence, str, bytes, or path."""
         if isinstance(cmd, (list, tuple)):
-            head = cmd[0] if cmd else None
-        elif isinstance(cmd, str):
-            parts = cmd.split()
-            head = parts[0] if parts else None
-        else:
-            head = None
-        if head is None:
+            return [_as_text(part) for part in cmd]
+        if isinstance(cmd, (str, bytes, bytearray, os.PathLike)):
+            return _split(_as_text(cmd))
+        return []
+
+    def _player_in(words):
+        for word in words:
+            name = os.path.basename(word)
+            if name in _AUDIO_PLAYER_COMMANDS:
+                return name
+        return None
+
+    def _audio_player_name(cmd):
+        tokens = _tokens(cmd)
+        if not tokens:
             return None
-        name = os.path.basename(str(head))
-        return name if name in _AUDIO_PLAYER_COMMANDS else None
+        head = os.path.basename(tokens[0])
+        if head in _AUDIO_PLAYER_COMMANDS:
+            return head
+        # ``sh -c "… afplay foo.wav …"`` — the WSL2 playback path. Scan the
+        # script for a player token. Over-matching here (a shell command that
+        # merely mentions a player name) costs a test author one bypass mark;
+        # under-matching costs a developer their speakers.
+        if head in _SHELL_COMMANDS:
+            for token in tokens[1:]:
+                found = _player_in(_split(token))
+                if found:
+                    return found
+        return None
 
     def _check_audio_cmd(call, cmd):
         name = _audio_player_name(cmd)
@@ -1613,19 +1663,29 @@ def _guard_audio_egress(monkeypatch):
             "real audio."
         )
 
-    for _call in ("run", "call", "check_call", "check_output"):
-        _real = getattr(_subprocess, _call, None)
+    def _make(call, real):
+        def _guarded(cmd, *args, **kwargs):
+            _check_audio_cmd(call, cmd)
+            return real(cmd, *args, **kwargs)
+        _guarded.__name__ = f"_audio_guarded_{call}"
+        return _guarded
+
+    # Every exec surface that can reach a player, not just the argv-shaped
+    # ones: ``os.system("afplay x.wav")`` is one call away from sound too.
+    for _module, _call in (
+        (_subprocess, "run"),
+        (_subprocess, "call"),
+        (_subprocess, "check_call"),
+        (_subprocess, "check_output"),
+        (_subprocess, "getoutput"),
+        (_subprocess, "getstatusoutput"),
+        (os, "system"),
+        (os, "popen"),
+    ):
+        _real = getattr(_module, _call, None)
         if _real is None:
             continue
-
-        def _make(call, real):
-            def _guarded(cmd, *args, **kwargs):
-                _check_audio_cmd(call, cmd)
-                return real(cmd, *args, **kwargs)
-            _guarded.__name__ = f"_audio_guarded_{call}"
-            return _guarded
-
-        monkeypatch.setattr(_subprocess, _call, _make(_call, _real))
+        monkeypatch.setattr(_module, _call, _make(_call, _real))
 
     # Subclass rather than wrap: ``Popen`` is used in isinstance checks and
     # subscripted (``Popen[bytes]``) elsewhere in the tree, which a plain
