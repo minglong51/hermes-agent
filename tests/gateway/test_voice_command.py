@@ -1052,6 +1052,57 @@ class TestAutoTtsEmptyTextGuard:
 class TestStreamTtsToSpeaker:
     """Functional tests for the streaming TTS pipeline."""
 
+    @pytest.fixture(autouse=True)
+    def _intercept_audio(self, monkeypatch):
+        """Stand recorders in front of synthesis and playback.
+
+        These tests drive the *real* ``stream_tts_to_speaker``. Left alone it
+        synthesizes through the keyless ``edge`` provider and plays the result
+        with ``afplay`` — which is how ``test_none_sentinel_flushes_buffer``
+        spoke "Hello world." out of a developer's speakers during an ordinary
+        test run. The conftest audio guard now blocks the player subprocess,
+        but a guard that merely silences the speakers would still leave this
+        class making a network round-trip per sentence and would leave its
+        assertions resting on a swallowed exception.
+
+        Recorders, not raising stubs: ``stream_tts_to_speaker`` wraps its body
+        in ``except Exception`` and would turn a failed assertion green.
+        Capturing instead lets each test assert on what *would* have been
+        spoken — a stronger check than the ``display_callback`` alone, which
+        fires before synthesis is ever attempted.
+        """
+        import tools.tts_streaming as tts_streaming
+        import tools.tts_tool as tts_tool
+        import tools.voice_mode as voice_mode
+
+        # Force the sync per-sentence branch: it is the one these tests
+        # exercise and the only one reachable without a streaming-provider
+        # API key, so this pins existing behaviour rather than changing it.
+        monkeypatch.setattr(
+            tts_streaming, "resolve_streaming_provider", lambda *a, **k: None
+        )
+
+        self.synthesized = []
+        self.played = []
+
+        def _fake_synth(text=None, output_path=None, **kwargs):
+            self.synthesized.append(text)
+            if output_path:
+                # Non-empty: the drain loop skips zero-byte files, and we want
+                # the playback call to be reached (and recorded).
+                with open(output_path, "wb") as fh:
+                    fh.write(b"\0" * 16)
+            return {"status": "success", "output_path": output_path}
+
+        def _fake_play(path, *args, **kwargs):
+            self.played.append(path)
+            return True
+
+        monkeypatch.setattr(tts_tool, "text_to_speech_tool", _fake_synth)
+        # Patched on tools.voice_mode because the pipeline late-imports it
+        # from there (tools/tts_tool.py ~3973); patching tts_tool would miss.
+        monkeypatch.setattr(voice_mode, "play_audio_file", _fake_play)
+
     def test_none_sentinel_flushes_buffer(self):
         """None sentinel causes remaining buffer to be spoken."""
         from tools.tts_tool import stream_tts_to_speaker
@@ -1069,6 +1120,10 @@ class TestStreamTtsToSpeaker:
         stream_tts_to_speaker(text_q, stop_evt, done_evt, display_callback=display)
         assert done_evt.is_set()
         assert any("Hello" in s for s in spoken)
+        # The sentinel must flush all the way through synthesis to playback —
+        # the two stages that were producing real sound before.
+        assert any("Hello" in (t or "") for t in self.synthesized)
+        assert self.played
 
     def test_stop_event_aborts_early(self):
         """Setting stop_event causes early exit."""

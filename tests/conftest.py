@@ -1015,6 +1015,14 @@ def _wal_is_usable() -> bool:
 #    ``hermes_cli.voice`` (not ``tools.voice_mode``) keeps the real function
 #    available to the tests that legitimately exercise it with a mocked
 #    audio backend (``tests/tools/test_voice_mode.py``).
+#  • the system audio players (``afplay``/``say``/``ffplay``/``aplay``) as a
+#    subprocess-level backstop — see ``_guard_audio_egress``. Both bullets
+#    above are route-specific, and a second incident proved the route set was
+#    incomplete: ``tools/tts_tool.py``'s ``stream_tts_to_speaker`` reaches the
+#    speakers with a late ``from tools.voice_mode import play_audio_file``,
+#    touching neither ``hermes_cli.voice`` nor any attribute a test could
+#    patch on ``tools.tts_tool``. Guarding the egress instead of enumerating
+#    callers is what makes the guard hold for routes nobody has found yet.
 #
 # Config cannot re-open this hole: the ``tts:`` section of ``config.yaml``
 # only selects *which* provider speaks, never *whether* to speak — that gate
@@ -1022,6 +1030,19 @@ def _wal_is_usable() -> bool:
 
 _AUDIO_GUARD_BYPASS_MARK = "real_audio_playback"
 _ALLOW_MACOS_KEYCHAIN_MARK = "allow_macos_keychain"
+
+# Executables that put sound on the speakers. ``play_audio_file`` builds its
+# player argv from this same set (``afplay`` on macOS, ``ffplay``/``aplay`` on
+# Linux); ``say`` is macOS' own TTS binary, reachable from any test that
+# shells out. Matched on the basename of the command head only — a fuzzy
+# substring match would block unrelated commands that merely mention them.
+_AUDIO_PLAYER_COMMANDS = frozenset({
+    "afplay",
+    "say",
+    "aplay",
+    "paplay",
+    "ffplay",
+})
 
 
 def pytest_configure(config):  # noqa: D401 — pytest hook
@@ -1521,7 +1542,104 @@ def _audio_playback_guard(request, monkeypatch):
     if hasattr(_voice, "play_audio_file"):
         monkeypatch.setattr(_voice, "play_audio_file", _blocked_play_audio_file)
 
+    _guard_audio_egress(monkeypatch)
+
     yield
+
+
+def _guard_audio_egress(monkeypatch):
+    """Block the system audio players — the route that bypasses the stubs.
+
+    The stubs in ``_audio_playback_guard`` only cover code that reaches the
+    speakers *through* ``hermes_cli.voice``. ``tools/tts_tool.py`` does not:
+    ``stream_tts_to_speaker`` synthesizes each sentence and plays it with a
+    late ``from tools.voice_mode import play_audio_file`` (tts_tool.py ~3973
+    and ~4332). Because that import is resolved from ``tools.voice_mode`` at
+    call time, patching either ``hermes_cli.voice`` or ``tools.tts_tool``
+    misses it entirely. This is the route that spoke "Hello world." out of a
+    developer's speakers from ``TestStreamTtsToSpeaker``.
+
+    We deliberately do *not* stub ``tools.voice_mode.play_audio_file`` itself.
+    ``tests/tools/test_voice_mode.py`` (and test_tts_streaming, the WSL/env
+    tests, …) call the real function with the audio backends mocked and
+    assert on the player argv it builds; stubbing the module attribute would
+    point those assertions at the stub and silently gut them. So the guard
+    sits one level lower, at the only place audio actually leaves the
+    process: the player subprocess. A test that mocks ``subprocess.Popen``
+    itself replaces this wrapper and is unaffected — a test that does not
+    gets a loud RuntimeError instead of sound.
+
+    Raising (rather than the silent stubbing above) is right here: a stray
+    player subprocess is spawned synchronously by the caller, so on the main
+    thread the error names the offending test, and on a daemon thread it is
+    swallowed exactly as the silent stubs would be. Either way, no audio.
+
+    Residual gap, documented rather than papered over: on non-macOS,
+    ``play_audio_file`` plays WAVs through ``sounddevice.play`` instead of a
+    subprocess. That path is not blocked here — patching ``sounddevice``
+    would either force the import (which on macOS triggers the TCC
+    media-library prompt ``_sounddevice_output_allowed`` exists to avoid) or
+    collide with tests that inject their own fake module. A player launched
+    through a shell wrapper (``sh -c "afplay …"``) is likewise unmatched,
+    since the command head is ``sh``; no hermes playback path does that, and
+    substring-matching the whole command line would start blocking unrelated
+    commands that merely mention a player's name.
+    """
+    import subprocess as _subprocess
+
+    def _audio_player_name(cmd):
+        if isinstance(cmd, (list, tuple)):
+            head = cmd[0] if cmd else None
+        elif isinstance(cmd, str):
+            parts = cmd.split()
+            head = parts[0] if parts else None
+        else:
+            head = None
+        if head is None:
+            return None
+        name = os.path.basename(str(head))
+        return name if name in _AUDIO_PLAYER_COMMANDS else None
+
+    def _check_audio_cmd(call, cmd):
+        name = _audio_player_name(cmd)
+        if name is None:
+            return
+        raise RuntimeError(
+            f"tests/conftest.py audio guard: blocked subprocess.{call}"
+            f"({cmd!r}) — {name!r} plays sound through the speakers. Mock the "
+            "playback backend in the test (patch tools.voice_mode."
+            "play_audio_file, or subprocess.Popen), or mark the test with "
+            f"@pytest.mark.{_AUDIO_GUARD_BYPASS_MARK} if it genuinely needs "
+            "real audio."
+        )
+
+    for _call in ("run", "call", "check_call", "check_output"):
+        _real = getattr(_subprocess, _call, None)
+        if _real is None:
+            continue
+
+        def _make(call, real):
+            def _guarded(cmd, *args, **kwargs):
+                _check_audio_cmd(call, cmd)
+                return real(cmd, *args, **kwargs)
+            _guarded.__name__ = f"_audio_guarded_{call}"
+            return _guarded
+
+        monkeypatch.setattr(_subprocess, _call, _make(_call, _real))
+
+    # Subclass rather than wrap: ``Popen`` is used in isinstance checks and
+    # subscripted (``Popen[bytes]``) elsewhere in the tree, which a plain
+    # function would break. Mirrors the live-system guard's _GuardedPopen.
+    _real_popen = _subprocess.Popen
+
+    class _AudioGuardedPopen(_real_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, cmd, *args, **kwargs):
+            _check_audio_cmd("Popen", cmd)
+            super().__init__(cmd, *args, **kwargs)
+
+    _AudioGuardedPopen.__name__ = "Popen"
+    _AudioGuardedPopen.__qualname__ = "Popen"
+    monkeypatch.setattr(_subprocess, "Popen", _AudioGuardedPopen)
 
 
 @pytest.fixture(autouse=True)

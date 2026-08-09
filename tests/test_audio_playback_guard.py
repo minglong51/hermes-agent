@@ -29,8 +29,11 @@ test from re-setting the variable mid-test.
 """
 
 import os
+import platform
+import subprocess
 import sys
 import types
+import wave
 
 import pytest
 
@@ -124,3 +127,111 @@ def test_bypass_marker_restores_the_real_speak_text():
     import hermes_cli.voice as voice
 
     assert voice.speak_text.__name__ == "speak_text"
+
+
+# =====================================================================
+# Second incident: the route that went around every stub above.
+#
+# "Hello world." came out of the speakers on an ordinary test run, from
+# ``tests/gateway/test_voice_command.py::TestStreamTtsToSpeaker::
+# test_none_sentinel_flushes_buffer``. That test calls the real
+# ``tools.tts_tool.stream_tts_to_speaker``, which synthesizes each sentence
+# through the keyless ``edge`` provider and plays it with a late
+# ``from tools.voice_mode import play_audio_file`` — touching neither
+# ``hermes_cli.voice`` (where the stubs above live) nor any attribute of
+# ``tools.tts_tool`` a patch could catch.
+#
+# The lesson is that enumerating routes does not converge: the fix is to
+# guard the *egress* — the player subprocess every route must eventually
+# reach. The tests below pin that behaviour.
+#
+# Note on arguments: each command below is given a target that is silent
+# even if the guard is broken (a nonexistent file, a nonexistent binary
+# path). A test that proves the speakers stay shut must not be the thing
+# that opens them when it regresses.
+# =====================================================================
+
+
+def test_unmarked_test_cannot_launch_afplay():
+    """``afplay`` is refused for every subprocess entry point."""
+    for call, invoke in (
+        ("run", lambda cmd: subprocess.run(cmd)),
+        ("call", lambda cmd: subprocess.call(cmd)),
+        ("check_call", lambda cmd: subprocess.check_call(cmd)),
+        ("check_output", lambda cmd: subprocess.check_output(cmd)),
+        ("Popen", lambda cmd: subprocess.Popen(cmd)),
+    ):
+        with pytest.raises(RuntimeError, match="audio guard") as excinfo:
+            invoke(["afplay", "/nonexistent/silent.wav"])
+        assert "real_audio_playback" in str(excinfo.value), (
+            f"subprocess.{call} was blocked but the error does not tell the "
+            "author how to opt out"
+        )
+
+
+def test_unmarked_test_cannot_launch_say():
+    """macOS' ``say`` is refused, including via an absolute path.
+
+    Basename matching is the point: ``/usr/bin/say`` is the same speaker.
+    """
+    with pytest.raises(RuntimeError, match="audio guard"):
+        subprocess.run(["/nonexistent/bin/say", "this must never be spoken"])
+
+    with pytest.raises(RuntimeError, match="audio guard"):
+        subprocess.Popen(["/nonexistent/bin/afplay", "/nonexistent/x.wav"])
+
+
+def test_guard_does_not_block_unrelated_subprocesses():
+    """The block is a scalpel — ordinary subprocesses still run.
+
+    Without this, a guard that over-matched (e.g. substring rather than
+    command basename) would pass every test above while quietly breaking
+    unrelated suites.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", "print('ok')"], capture_output=True, text=True
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "ok"
+
+
+@pytest.mark.skipif(
+    platform.system() != "Darwin",
+    reason="non-Darwin plays WAVs through sounddevice, not a subprocess — a "
+    "documented residual gap in _guard_audio_egress",
+)
+def test_tts_tool_playback_route_cannot_reach_the_speakers(tmp_path):
+    """End-to-end: the exact call the TTS pipeline makes, and it stays silent.
+
+    ``tools.voice_mode.play_audio_file`` is called here unmocked, with a real
+    playable WAV — precisely what ``stream_tts_to_speaker`` does per sentence.
+    It must fail closed. ``play_audio_file`` swallows the guard's RuntimeError
+    in its per-player ``except Exception`` and falls through to "no player
+    available", so ``False`` is the observable signature of a blocked play.
+    """
+    wav_path = tmp_path / "silence.wav"
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(b"\x00\x00" * 2400)
+
+    from tools.voice_mode import play_audio_file
+
+    assert play_audio_file(str(wav_path)) is False, (
+        "audio guard breached: play_audio_file reached a system player — on "
+        "an unguarded run this is real sound out of the speakers"
+    )
+
+
+@pytest.mark.real_audio_playback
+def test_bypass_marker_restores_real_subprocess():
+    """The marker un-blocks the players for tests that genuinely need them.
+
+    Uses a nonexistent binary so nothing is spawned: under the guard the
+    command is rejected before exec with ``RuntimeError``; with the guard
+    lifted it reaches exec and fails with ``FileNotFoundError``. The exception
+    type is the whole assertion.
+    """
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(["/nonexistent/bin/afplay", "/nonexistent/x.wav"])
