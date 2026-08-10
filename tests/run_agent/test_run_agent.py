@@ -2207,7 +2207,69 @@ class TestConcurrentToolExecution:
             mock_todo.assert_called_once()
         assert "ok" in result
 
+    @pytest.mark.parametrize("execution_path", ["inline", "sequential"])
+    def test_session_search_uses_requested_profile_database(
+        self, agent, monkeypatch, tmp_path, execution_path
+    ):
+        """Both runtime executors reach the requested profile DB (#82903)."""
+        from hermes_state import SessionDB
 
+        hermes_home = tmp_path / "hermes-home"
+        profile_home = hermes_home / "profiles" / "llm-wiki"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        current_db = SessionDB(hermes_home / "state.db")
+        current_db.create_session("default-session", source="gateway")
+        current_db.append_message(
+            "default-session", role="user", content="weekly report default"
+        )
+        assert current_db._conn is not None
+        current_db._conn.commit()
+
+        profile_db = SessionDB(profile_home / "state.db")
+        profile_db.create_session("profile-session", source="cli")
+        profile_db.append_message(
+            "profile-session", role="user", content="weekly report llm wiki"
+        )
+        assert profile_db._conn is not None
+        profile_db._conn.commit()
+        profile_db.close()
+
+        monkeypatch.setattr(
+            agent, "_get_session_db_for_recall", lambda: current_db
+        )
+        tool_args = {"query": "weekly report", "profile": "llm-wiki"}
+
+        try:
+            if execution_path == "inline":
+                raw_result = agent._invoke_tool(
+                    "session_search", tool_args, "task-1"
+                )
+            else:
+                tool_call = _mock_tool_call(
+                    name="session_search",
+                    arguments=json.dumps(tool_args),
+                    call_id="session-search-1",
+                )
+                messages = []
+                agent._execute_tool_calls_sequential(
+                    _mock_assistant_msg(content="", tool_calls=[tool_call]),
+                    messages,
+                    "task-1",
+                )
+                raw_result = messages[-1]["content"]
+        finally:
+            current_db.close()
+
+        result = json.loads(raw_result)
+        assert result["success"] is True
+        assert [entry["session_id"] for entry in result["results"]] == [
+            "profile-session"
+        ]
+        assert result["results"][0]["link"] == (
+            "@session:llm-wiki/profile-session"
+        )
 
 
     def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
